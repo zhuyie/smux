@@ -89,35 +89,28 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	default:
 	}
 
-	frames := s.split(b, cmdPSH, s.id)
-	sent := 0
-	for k := range frames {
-		req := writeRequest{
-			frame:  frames[k],
-			result: make(chan writeResult, 1),
-		}
+	req := s.sess.allocWriteRequest()
+	s.split(b, cmdPSH, s.id, req)
 
-		select {
-		case s.sess.writes <- req:
-		case <-s.die:
-			return sent, errors.New(errBrokenPipe)
-		case <-deadline:
-			return sent, errTimeout
-		}
-
-		select {
-		case result := <-req.result:
-			sent += result.n
-			if result.err != nil {
-				return sent, result.err
-			}
-		case <-s.die:
-			return sent, errors.New(errBrokenPipe)
-		case <-deadline:
-			return sent, errTimeout
-		}
+	select {
+	case s.sess.writes <- req:
+	case <-s.die:
+		s.sess.freeWriteRequest(req)
+		return 0, errors.New(errBrokenPipe)
+	case <-deadline:
+		s.sess.freeWriteRequest(req)
+		return 0, errTimeout
 	}
-	return sent, nil
+
+	select {
+	case err = <-req.result:
+		s.sess.freeWriteRequest(req)
+		return len(b), err
+	case <-s.die:
+		return 0, errors.New(errBrokenPipe)
+	case <-deadline:
+		return 0, errTimeout
+	}
 }
 
 // Close implements net.Conn
@@ -132,7 +125,7 @@ func (s *Stream) Close() error {
 		close(s.die)
 		s.dieLock.Unlock()
 		s.sess.streamClosed(s.id)
-		_, err := s.sess.writeFrame(newFrame(cmdFIN, s.id))
+		_, err := s.sess.writeFrame(newFrame(cmdFIN, s.id, nil))
 		return err
 	}
 }
@@ -215,20 +208,16 @@ func (s *Stream) recycleTokens() (n int) {
 }
 
 // split large byte buffer into smaller frames, reference only
-func (s *Stream) split(bts []byte, cmd byte, sid uint32) []Frame {
-	frames := make([]Frame, 0, len(bts)/s.frameSize+1)
+func (s *Stream) split(bts []byte, cmd byte, sid uint32, req *writeRequest) {
 	for len(bts) > s.frameSize {
-		frame := newFrame(cmd, sid)
-		frame.data = bts[:s.frameSize]
+		frame := newFrame(cmd, sid, bts[:s.frameSize])
 		bts = bts[s.frameSize:]
-		frames = append(frames, frame)
+		req.frames = append(req.frames, frame)
 	}
 	if len(bts) > 0 {
-		frame := newFrame(cmd, sid)
-		frame.data = bts
-		frames = append(frames, frame)
+		frame := newFrame(cmd, sid, bts)
+		req.frames = append(req.frames, frame)
 	}
-	return frames
 }
 
 // notify read event

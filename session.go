@@ -1,8 +1,8 @@
 package smux
 
 import (
-	"encoding/binary"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +12,10 @@ import (
 
 const (
 	defaultAcceptBacklog = 1024
+	defaultWriteQueueLen = 64
+	maxFreeWriteReqs     = 1024
+	maxBatchWriteLen     = 16
+	maxBatchWriteBytes   = 130 * 1024
 )
 
 const (
@@ -21,13 +25,16 @@ const (
 )
 
 type writeRequest struct {
-	frame  Frame
-	result chan writeResult
+	frames []Frame
+	result chan error
 }
 
-type writeResult struct {
-	n   int
-	err error
+func (wr *writeRequest) Len() (n int) {
+	for i := 0; i < len(wr.frames); i++ {
+		n += headerSize
+		n += len(wr.frames[i].data)
+	}
+	return
 }
 
 // Session defines a multiplexed connection for streams
@@ -54,7 +61,8 @@ type Session struct {
 
 	deadline atomic.Value
 
-	writes chan writeRequest
+	writes        chan *writeRequest
+	freeWriteReqs chan *writeRequest
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
@@ -66,7 +74,8 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chAccepts = make(chan *Stream, defaultAcceptBacklog)
 	s.bucket = int32(config.MaxReceiveBuffer)
 	s.bucketNotify = make(chan struct{}, 1)
-	s.writes = make(chan writeRequest)
+	s.writes = make(chan *writeRequest, defaultWriteQueueLen)
+	s.freeWriteReqs = make(chan *writeRequest, maxFreeWriteReqs)
 
 	if client {
 		s.nextStreamID = 1
@@ -103,7 +112,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
-	if _, err := s.writeFrame(newFrame(cmdSYN, sid)); err != nil {
+	if _, err := s.writeFrame(newFrame(cmdSYN, sid, nil)); err != nil {
 		return nil, errors.Wrap(err, "writeFrame")
 	}
 
@@ -207,48 +216,61 @@ func (s *Session) returnTokens(n int) {
 	}
 }
 
-// session read a frame from underlying connection
-// it's data is pointed to the input buffer
-func (s *Session) readFrame(buffer []byte) (f Frame, err error) {
-	if _, err := io.ReadFull(s.conn, buffer[:headerSize]); err != nil {
-		return f, errors.Wrap(err, "readFrame")
-	}
-
-	dec := rawHeader(buffer)
-	if dec.Version() != version {
-		return f, errors.New(errInvalidProtocol)
-	}
-
-	f.ver = dec.Version()
-	f.cmd = dec.Cmd()
-	f.sid = dec.StreamID()
-	if length := dec.Length(); length > 0 {
-		if _, err := io.ReadFull(s.conn, buffer[headerSize:headerSize+length]); err != nil {
-			return f, errors.Wrap(err, "readFrame")
+// decodeFrame try to decode a frame from dataBuf
+func (s *Session) decodeFrame(dataBuf *[]byte) (f Frame, ok bool, err error) {
+	if len(*dataBuf) >= headerSize {
+		dec := rawHeader(*dataBuf)
+		if dec.Version() != version {
+			return f, false, errors.New(errInvalidProtocol)
 		}
-		f.data = buffer[headerSize : headerSize+length]
+		if length := int(dec.Length()); len(*dataBuf) >= headerSize+length {
+			copy(f.header[:], *dataBuf)
+			f.data = (*dataBuf)[headerSize : headerSize+length]
+			*dataBuf = (*dataBuf)[headerSize+length:]
+			return f, true, nil
+		}
 	}
-	return f, nil
+	return f, false, nil
 }
 
 // recvLoop keeps on reading from underlying connection if tokens are available
 func (s *Session) recvLoop() {
-	buffer := make([]byte, (1<<16)+headerSize)
+	buffer := make([]byte, 130*1024)
+	off := 0
 	for {
 		for atomic.LoadInt32(&s.bucket) <= 0 && !s.IsClosed() {
 			<-s.bucketNotify
 		}
 
-		if f, err := s.readFrame(buffer); err == nil {
-			atomic.StoreInt32(&s.dataReady, 1)
+		n, _ := s.conn.Read(buffer[off:])
+		if n <= 0 {
+			s.Close()
+			return
+		}
+		off += n
 
-			switch f.cmd {
+		atomic.StoreInt32(&s.dataReady, 1)
+
+		dataBuf := buffer[:off]
+		dataLen := len(dataBuf)
+		for {
+			f, ok, err := s.decodeFrame(&dataBuf)
+			if err != nil {
+				s.Close()
+				return
+			}
+			if !ok {
+				break
+			}
+
+			h := rawHeader(f.header[:])
+			switch h.Cmd() {
 			case cmdNOP:
 			case cmdSYN:
 				s.streamLock.Lock()
-				if _, ok := s.streams[f.sid]; !ok {
-					stream := newStream(f.sid, s.config.MaxFrameSize, s)
-					s.streams[f.sid] = stream
+				if _, ok := s.streams[h.StreamID()]; !ok {
+					stream := newStream(h.StreamID(), s.config.MaxFrameSize, s)
+					s.streams[h.StreamID()] = stream
 					select {
 					case s.chAccepts <- stream:
 					case <-s.die:
@@ -257,14 +279,14 @@ func (s *Session) recvLoop() {
 				s.streamLock.Unlock()
 			case cmdFIN:
 				s.streamLock.Lock()
-				if stream, ok := s.streams[f.sid]; ok {
+				if stream, ok := s.streams[h.StreamID()]; ok {
 					stream.markRST()
 					stream.notifyReadEvent()
 				}
 				s.streamLock.Unlock()
 			case cmdPSH:
 				s.streamLock.Lock()
-				if stream, ok := s.streams[f.sid]; ok {
+				if stream, ok := s.streams[h.StreamID()]; ok {
 					atomic.AddInt32(&s.bucket, -int32(len(f.data)))
 					stream.pushBytes(f.data)
 					stream.notifyReadEvent()
@@ -274,9 +296,16 @@ func (s *Session) recvLoop() {
 				s.Close()
 				return
 			}
+		}
+
+		remains := len(dataBuf)
+		if remains > 0 {
+			if remains != dataLen {
+				copy(buffer, dataBuf)
+				off = remains
+			}
 		} else {
-			s.Close()
-			return
+			off = 0
 		}
 	}
 }
@@ -289,7 +318,7 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-tickerPing.C:
-			s.writeFrame(newFrame(cmdNOP, 0))
+			s.writeFrame(newFrame(cmdNOP, 0, nil))
 			s.notifyBucket() // force a signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.dataReady, 1, 0) {
@@ -303,51 +332,92 @@ func (s *Session) keepalive() {
 }
 
 func (s *Session) sendLoop() {
-	buf := make([]byte, (1<<16)+headerSize)
+	var requests []*writeRequest
+	var buffers, tmpBuffers net.Buffers
 	for {
+		var requestsBytes int
 		select {
 		case <-s.die:
 			return
-		case request, ok := <-s.writes:
-			if !ok {
-				continue
+		case req := <-s.writes:
+			requests = append(requests, req)
+			requestsBytes += req.Len()
+			for q := false; !q; {
+				select {
+				case <-s.die:
+					return
+				case req := <-s.writes:
+					requests = append(requests, req)
+					requestsBytes += req.Len()
+					if requestsBytes >= maxBatchWriteBytes || len(requests) >= maxBatchWriteLen {
+						q = true
+					}
+				default:
+					q = true
+				}
 			}
-			buf[0] = request.frame.ver
-			buf[1] = request.frame.cmd
-			binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
-			binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
-			copy(buf[headerSize:], request.frame.data)
-			n, err := s.conn.Write(buf[:headerSize+len(request.frame.data)])
-
-			n -= headerSize
-			if n < 0 {
-				n = 0
-			}
-
-			result := writeResult{
-				n:   n,
-				err: err,
-			}
-
-			request.result <- result
-			close(request.result)
 		}
+
+		for _, req := range requests {
+			for i := 0; i < len(req.frames); i++ {
+				buffers = append(buffers, req.frames[i].header[:])
+				if length := len(req.frames[i].data); length > 0 {
+					buffers = append(buffers, req.frames[i].data)
+				}
+			}
+		}
+
+		tmpBuffers = buffers
+		_, err := tmpBuffers.WriteTo(s.conn)
+
+		for _, req := range requests {
+			req.result <- err
+		}
+
+		requests = requests[0:0]
+		buffers = buffers[0:0]
 	}
 }
 
 // writeFrame writes the frame to the underlying connection
 // and returns the number of bytes written if successful
 func (s *Session) writeFrame(f Frame) (n int, err error) {
-	req := writeRequest{
-		frame:  f,
-		result: make(chan writeResult, 1),
-	}
+	req := s.allocWriteRequest()
+	req.frames = append(req.frames, f)
+
 	select {
-	case <-s.die:
-		return 0, errors.New(errBrokenPipe)
 	case s.writes <- req:
+	case <-s.die:
+		s.freeWriteRequest(req)
+		return 0, errors.New(errBrokenPipe)
 	}
 
-	result := <-req.result
-	return result.n, result.err
+	select {
+	case err = <-req.result:
+		s.freeWriteRequest(req)
+		return len(f.data), err
+	case <-s.die:
+		return 0, errors.New(errBrokenPipe)
+	}
+}
+
+func (s *Session) allocWriteRequest() (req *writeRequest) {
+	select {
+	case req = <-s.freeWriteReqs:
+	default:
+	}
+	if req == nil {
+		req = &writeRequest{}
+		req.frames = make([]Frame, 0, 32)
+		req.result = make(chan error, 1)
+	}
+	return
+}
+
+func (s *Session) freeWriteRequest(req *writeRequest) {
+	req.frames = req.frames[0:0]
+	select {
+	case s.freeWriteReqs <- req:
+	default:
+	}
 }

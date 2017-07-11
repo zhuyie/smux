@@ -26,14 +26,17 @@ const (
 
 // Frame defines a packet from or to be multiplexed into a single connection
 type Frame struct {
-	ver  byte
-	cmd  byte
-	sid  uint32
-	data []byte
+	header [headerSize]byte
+	data   []byte
 }
 
-func newFrame(cmd byte, sid uint32) Frame {
-	return Frame{ver: version, cmd: cmd, sid: sid}
+func newFrame(cmd byte, sid uint32, data []byte) (f Frame) {
+	f.header[0] = version
+	f.header[1] = cmd
+	binary.LittleEndian.PutUint16(f.header[2:], uint16(len(data)))
+	binary.LittleEndian.PutUint32(f.header[4:], sid)
+	f.data = data
+	return
 }
 
 type rawHeader []byte
